@@ -1,4 +1,4 @@
-#ped2studio
+# ped2studio
 Convert standard PED pedigree files into Pedigree Studio session JSON files.
 Installation
 ```bash
