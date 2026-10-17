@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ped2studio"
-version = "0.1.0"
-description = "Convert PED pedigree files to Pedigree Studio session JSON"
+version = "0.2.1"
+description = "Convert PED and MPED pedigree files to Pedigree Studio session JSON"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
@@ -23,7 +23,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
 ]
-keywords = ["pedigree", "genetics", "ped", "family-tree", "clinical-genetics"]
+keywords = ["pedigree", "genetics", "ped", "mped", "family-tree", "clinical-genetics"]
 authors = [
     {name = "Tim Hearn", email = "tjh70@cam.ac.uk"},
 ]
@@ -32,7 +32,6 @@ authors = [
 ped2studio = "ped2studio.cli:main"
 
 [project.urls]
-# UPDATE THESE to your actual repository URLs before publishing
 Homepage = "https://github.com/comparativechrono/ped2studio"
 Issues = "https://github.com/comparativechrono/ped2studio/issues"
 
