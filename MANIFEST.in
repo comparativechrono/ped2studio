@@ -1,0 +1,4 @@
+include CHANGELOG.md
+include ped2studio_standalone.py
+include tools/make_standalone.py
+recursive-include tests *.py *.ped *.mped

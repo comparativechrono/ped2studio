@@ -1,6 +1,9 @@
 # ped2studio
 
-Convert standard PED pedigree files into [Pedigree Studio](https://github.com/your-org/pedigree-studio) session JSON files.
+Convert PED and MPED pedigree files into
+[Pedigree Studio](https://github.com/comparativechrono/PedigreeStudio) session
+JSON files, so that a family recorded in a table can be drawn, checked and
+edited.
 
 ## Installation
 
@@ -8,7 +11,8 @@ Convert standard PED pedigree files into [Pedigree Studio](https://github.com/yo
 pip install ped2studio
 ```
 
-Or use the standalone script (`ped2studio_standalone.py`) with no installation required — it needs only Python 3.9+.
+Or use the standalone script (`ped2studio_standalone.py`) with no installation
+required: it needs only Python 3.9+.
 
 ## Usage
 
@@ -37,6 +41,13 @@ ped2studio family.ped family.json --shading --pattern stripes
 ped2studio family.ped family.json --shading --pattern dots --fill half
 ```
 
+Open the result in Pedigree Studio with **File → Open**. ped2studio lays the
+family out simply; press **Tidy** in Pedigree Studio to arrange it properly.
+
+The command says how many people, couples and child lines it drew, and prints
+a note about anything the drawing can't show as the file does (see
+[What can't be drawn](#what-cant-be-drawn)).
+
 ### Python API
 
 ```python
@@ -59,6 +70,10 @@ session = ped2studio.convert(
     use_shading=True,           # use pattern instead of colour
     shading_pattern="stripes",  # 'stripes' or 'dots'
 )
+
+# Collect the notes the command prints
+notes = []
+session = ped2studio.convert(ped_text, notes=notes)
 ```
 
 ### Standalone script
@@ -69,21 +84,28 @@ python ped2studio_standalone.py family.ped family.json --fill half --colour "#c0
 python ped2studio_standalone.py family.ped family.json --shading --pattern dots --fill half
 ```
 
-## MPED Support
+The script is the package in one file, made by `python tools/make_standalone.py`;
+a test checks that the two agree.
 
-MPED (Multi-Phenotype PED) files are automatically detected and handled. When an MPED file has multiple phenotype columns, each phenotype is assigned a distinct colour from the Pedigree Studio palette and a legend is generated mapping colours to phenotype names.
+## MPED support
 
-Visual mapping for multi-phenotype files:
+MPED (multi-phenotype PED) files are detected and handled automatically. When
+an MPED file has several phenotype columns, each phenotype is given its own
+colour from Pedigree Studio's palette, and the colour key names them.
 
-| Individual Status | Pedigree Studio Rendering |
+How each person is drawn when there are several phenotypes:
+
+| Individual's status | Drawn in Pedigree Studio as |
 |-------------------|--------------------------|
-| Affected for 1 phenotype | Solid fill with that phenotype's colour |
-| Affected for 2-4 phenotypes | Quartered fill with each phenotype's colour |
-| Carrier for 1 phenotype | Half fill (left) with that phenotype's colour |
+| Affected for 1 phenotype | Solid fill in that phenotype's colour |
+| Affected for 2 or more phenotypes | Quartered fill, in the colours of up to four of them |
+| Carrier for 1 phenotype | Half fill (left) in that phenotype's colour |
+| Carrier for 2 or more phenotypes | Quartered fill in their colours |
 | Carrier column = 3 | Centre dot (●) |
 | Unaffected | No fill |
 
-For single-phenotype MPED files, the `--color`, `--fill`, and `--shading` options work as normal.
+For MPED files with a single phenotype, the `--colour`, `--fill` and
+`--shading` options work as they do for PED files.
 
 ## PED file format
 
@@ -95,14 +117,22 @@ FamilyID  IndividualID  FatherID  MotherID  Sex  Phenotype
 
 | Column | Description |
 |--------|-------------|
-| FamilyID | Family identifier (preserved but not used for grouping) |
-| IndividualID | Unique identifier for the individual |
+| FamilyID | Family identifier: not shown in the drawing, but it keeps families apart (see below) |
+| IndividualID | Identifier for the individual, written under their symbol |
 | FatherID | Father's IndividualID, or `0` if unknown |
 | MotherID | Mother's IndividualID, or `0` if unknown |
 | Sex | `1` = male, `2` = female, `0` = unknown |
 | Phenotype | `2` = affected, `1` = unaffected, `0` or `-9` = unknown |
 
-Additional columns beyond column 6 (e.g. genotype data) are ignored. Lines starting with `#` are treated as comments. Both tab and space delimiters are supported.
+Additional columns beyond column 6 (e.g. genotype data) are ignored. Lines
+starting with `#` are treated as comments. Both tab and space delimiters are
+supported, and the file is read as UTF-8.
+
+A file can hold several families, and they may reuse the same ids (PLINK's
+files number each family's people 1, 2, 3 …). People with the same id in
+different families are different people: they are drawn separately, each with
+the id from the file under their symbol, and a note lists the ids that were
+shared.
 
 ## How it works
 
@@ -112,7 +142,15 @@ Additional columns beyond column 6 (e.g. genotype data) are ignored. Lines start
 4. **Layout** individuals using Pedigree Studio's default spacing (partner gap = 104px, child height = 130px, sibling spacing = 104px)
 5. **Emit** a Pedigree Studio v4 session JSON with persons, partnerships, child links, and legend
 
-The output can be imported directly into Pedigree Studio via the **Import JSON** button. Positions may need manual adjustment for complex pedigrees.
+Positions may need adjusting for complex pedigrees: Pedigree Studio's **Tidy**
+does that.
+
+## What can't be drawn
+
+Pedigree Studio draws a child's line from a couple. A child is therefore
+joined to their parents only when the file gives both parents and both are in
+the file. A child with only one parent given, or whose parent is not in the
+file, is drawn without a line, and the command prints a note naming them.
 
 ## Mapping to Pedigree Studio features
 
@@ -121,11 +159,18 @@ The output can be imported directly into Pedigree Studio via the **Import JSON**
 | Sex = 1 | `male` shape (square) |
 | Sex = 2 | `female` shape (circle) |
 | Sex = 0 | `unknown` shape (diamond) |
-| Phenotype = 2 | Solid colour fill, half colour fill, or shading pattern (configurable via `--fill`, `--color`, `--shading`, `--pattern`) |
+| Phenotype = 2 | Solid colour fill, half colour fill, or shading pattern (configurable via `--fill`, `--colour`, `--shading`, `--pattern`) |
 | Phenotype = 1 | No fill |
-| Father+Mother pair | Partnership line |
+| Father+Mother pair | Partnership line (a consanguineous line when the two share an ancestor) |
 | Child of a pair | Child link from partnership to individual |
 
-## License
+## Development
+
+```bash
+pip install -e ".[test]"
+pytest
+```
+
+## Licence
 
 MIT
