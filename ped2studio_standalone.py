@@ -1,21 +1,30 @@
 #!/usr/bin/env python3
 """
-ped2studio_standalone.py - Convert PED pedigree files to Pedigree Studio session JSON.
+ped2studio_standalone.py - Convert PED/MPED pedigree files to Pedigree Studio session JSON.
 
-Standalone single-file script. No installation required - needs only Python 3.9+.
+Standalone single-file script: ped2studio 0.2.2 in one file, so no
+installation is required - it needs only Python 3.9+.
+
+Usage:
+    python ped2studio_standalone.py family.ped family.json [--colour HEX] [--fill full|half] [--shading --pattern stripes|dots]
+
+This file is made from the package by tools/make_standalone.py: change the
+package, not this file.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
-__version__ = "0.1.0"
+__version__ = "0.2.2"
 
+# ── Pedigree Studio default constants ──────────────────────────────────────
 SHAPE_SIZE = 52
 SHAPE_HALF = 26
 PARTNER_GAP = SHAPE_SIZE * 2       # 104 px between partner left-edges
@@ -25,6 +34,12 @@ MIN_BLOCK_GAP = 60                 # minimum gap between unrelated blocks in sam
 AFFECTED_COLOR = "#1a2332"         # default fill colour for affected individuals
 STROKE_COLOR = "#1a2332"
 
+# Colour palette for multi-phenotype MPED files (matches Pedigree Studio FILL_COLORS)
+PHENOTYPE_PALETTE = [
+    '#c0392b', '#2980b9', '#27ae60', '#e67e22',
+    '#8e44ad', '#f1c40f', '#16a085', '#d35400', '#7f8c8d',
+]
+
 SEX_MAP = {1: "male", 2: "female"}
 DEFAULT_SEX = "unknown"
 
@@ -33,18 +48,22 @@ DEFAULT_SEX = "unknown"
 
 @dataclass
 class Individual:
-    """One row of the PED file."""
+    """One row of a PED or MPED file."""
     family_id: str
     ind_id: str
     father_id: Optional[str]     # None means unknown/missing
     mother_id: Optional[str]
     sex: int                      # 1=male, 2=female, other=unknown
-    phenotype: int                # 2=affected, 1=unaffected, 0/-9=unknown
+    phenotype: int                # primary phenotype: 2=affected, 1=unaffected, 0=unknown
+    phenotypes: dict[str, int] = field(default_factory=dict)
+    # Named phenotypes: {column_name: code} where code is 0-3 (0=unknown, 1=unaffected, 2=affected, 3=carrier)
     generation: int = -1
     x: float = 0.0
     y: float = 0.0
-    partners: list[str] = field(default_factory=list)      # individual IDs
-    mating_units: list[str] = field(default_factory=list)   # mating-unit keys
+    partners: list[str] = field(default_factory=list)
+    mating_units: list[str] = field(default_factory=list)
+    label: str = ""               # the id as written in the file (ind_id is made unique if
+                                  # the same id is used in more than one family)
 
 
 @dataclass
@@ -58,21 +77,47 @@ class MatingUnit:
 
 # ── PED parser ─────────────────────────────────────────────────────────────
 
-def parse_ped(text: str) -> dict[str, Individual]:
-    """Parse PED-format text into a dict of Individual keyed by ind_id.
+def parse_ped(text: str, notes: Optional[list] = None) -> tuple[dict[str, Individual], list[str]]:
+    """Parse PED or MPED format text into individuals.
 
-    Accepts tab- or space-delimited lines. Lines starting with # are ignored.
-    Minimum 6 columns: FamilyID  IndividualID  FatherID  MotherID  Sex  Phenotype
-    Father/Mother IDs of '0' or '-9' are treated as missing.
+    Detects MPED format automatically by looking for the '# MPED v' header line.
+    For standard PED, creates a single phenotype named 'Phenotype'.
+
+    An individual id is often used again in another family (PLINK's files
+    number the people of each family 1, 2, 3 ...). Such people are kept apart:
+    their ``ind_id`` becomes ``FAMILY/ID``, their ``label`` stays ``ID``, and
+    a note is added to ``notes`` if a list is given.
+
+    Returns
+    -------
+    tuple of (dict[str, Individual], list[str])
+        The individuals dict keyed by ind_id, and the ordered list of
+        phenotype column names.
     """
     individuals: dict[str, Individual] = {}
     missing = {"0", "-9", ""}
+    rows: list = []
+
+    # Detect MPED format
+    is_mped = False
+    phenotype_names: list[str] = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("# MPED v"):
+            is_mped = True
+            parts = line.split("\t")
+            phenotype_names = [p.strip() for p in parts[1:] if p.strip()]
+            break
+
+    if not is_mped:
+        phenotype_names = ["Phenotype"]
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split()
+        parts = line.split("\t") if is_mped else line.split()
         if len(parts) < 6:
             continue
 
@@ -84,21 +129,90 @@ def parse_ped(text: str) -> dict[str, Individual]:
             sex = int(parts[4])
         except ValueError:
             sex = 0
-        try:
-            pheno = int(parts[5])
-        except ValueError:
-            pheno = 0
 
-        individuals[ind_id] = Individual(
+        # Parse phenotype columns
+        pheno_dict: dict[str, int] = {}
+        for j, pname in enumerate(phenotype_names):
+            col_idx = 5 + j
+            if col_idx < len(parts):
+                try:
+                    pheno_dict[pname] = int(parts[col_idx])
+                except ValueError:
+                    pheno_dict[pname] = 0
+            else:
+                pheno_dict[pname] = 0
+
+        # Primary phenotype: affected (2) if any phenotype is 2
+        primary = 0
+        for v in pheno_dict.values():
+            if v == 2:
+                primary = 2
+                break
+        if primary == 0:
+            for v in pheno_dict.values():
+                if v == 1:
+                    primary = 1
+                    break
+
+        rows.append((fam_id, ind_id, father, mother, sex, primary, pheno_dict))
+
+    # The same id in more than one family is more than one person
+    families_of: dict[str, set] = defaultdict(set)
+    for fam_id, ind_id, *_ in rows:
+        families_of[ind_id].add(fam_id)
+    shared = sorted(i for i, fams in families_of.items() if len(fams) > 1)
+
+    def key(fam_id: str, ind_id: Optional[str]) -> Optional[str]:
+        if ind_id is None:
+            return None
+        return f"{fam_id}/{ind_id}" if ind_id in families_of and len(families_of[ind_id]) > 1 else ind_id
+
+    for fam_id, ind_id, father, mother, sex, primary, pheno_dict in rows:
+        individuals[key(fam_id, ind_id)] = Individual(
             family_id=fam_id,
-            ind_id=ind_id,
-            father_id=father,
-            mother_id=mother,
+            ind_id=key(fam_id, ind_id),
+            father_id=key(fam_id, father),
+            mother_id=key(fam_id, mother),
             sex=sex,
-            phenotype=pheno,
+            phenotype=primary,
+            phenotypes=pheno_dict,
+            label=ind_id,
         )
 
-    return individuals
+    if shared and notes is not None:
+        listed = _and(shared) if len(shared) <= 10 else ", ".join(shared[:10]) + f" and {len(shared) - 10} more"
+        notes.append(f"{'the id' if len(shared) == 1 else 'the ids'} {listed} {'is' if len(shared) == 1 else 'are'} "
+                     f"used in more than one family; the families are kept apart, and each person is labelled "
+                     f"with their id from the file")
+
+    return individuals, phenotype_names
+
+
+def _and(items) -> str:
+    items = list(items)
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def parent_notes(inds: dict[str, Individual]) -> list[str]:
+    """Notes on children who will be drawn without a line to their parents.
+
+    Pedigree Studio draws a child's line from a couple, so a child is joined to
+    their parents only when the file gives both, and both are in the file.
+    """
+    notes = []
+    for ind in inds.values():
+        parents = [(role, pid) for role, pid in (("father", ind.father_id), ("mother", ind.mother_id)) if pid]
+        if not parents or (len(parents) == 2 and all(pid in inds for _, pid in parents)):
+            continue
+        absent = [f"{role} {pid}" for role, pid in parents if pid not in inds]
+        if absent:
+            notes.append(f"{ind.ind_id}'s {_and(absent)} {'is' if len(absent) == 1 else 'are'} not in the file, "
+                         f"so {ind.ind_id} is drawn without a line to their parents")
+        else:
+            role, pid = parents[0]
+            notes.append(f"{ind.ind_id} has only one parent in the file, their {role} {pid}; Pedigree Studio draws "
+                         f"a child's line from a couple, so {ind.ind_id} is drawn without one")
+    return notes
 
 
 # ── Graph analysis ─────────────────────────────────────────────────────────
@@ -431,12 +545,17 @@ def compute_layout(inds: dict[str, Individual], units: dict[str, MatingUnit], nu
 def build_session(
     inds: dict[str, Individual],
     units: dict[str, MatingUnit],
+    phenotype_names: list[str],
     affected_color: str = AFFECTED_COLOR,
     use_shading: bool = False,
     shading_pattern: str = "stripes",
     fill_type: str = "full",
 ) -> dict:
-    """Build a Pedigree Studio v4 session dict."""
+    """Build a Pedigree Studio v4 session dict.
+
+    Handles both single-phenotype PED and multi-phenotype MPED data.
+    For multi-phenotype, assigns a colour per phenotype from the palette.
+    """
     persons = []
     partnerships = []
     child_links = []
@@ -445,6 +564,20 @@ def build_session(
     pid_counter = 0
     pship_counter = 0
     cl_counter = 0
+
+    # Determine if this is multi-phenotype
+    # Filter out "Carrier" column — it maps to centre dot, not a colour
+    visual_phenotypes = [n for n in phenotype_names if n.lower() != "carrier"]
+    carrier_column = next((n for n in phenotype_names if n.lower() == "carrier"), None)
+    is_multi = len(visual_phenotypes) > 1
+
+    # Assign colours to phenotypes
+    pheno_colors: dict[str, str] = {}
+    if is_multi:
+        for i, pname in enumerate(visual_phenotypes):
+            pheno_colors[pname] = PHENOTYPE_PALETTE[i % len(PHENOTYPE_PALETTE)]
+    elif visual_phenotypes:
+        pheno_colors[visual_phenotypes[0]] = affected_color
 
     # Map individual IDs to Pedigree Studio person IDs
     id_map: dict[str, str] = {}
@@ -458,36 +591,87 @@ def build_session(
         fill_mode = "none"
         fill_color = affected_color
         halves = [None, None]
+        quarters = [None, None, None, None]
         shading_pat = "stripes"
         shading_cov = "full"
+        center_text = ""
 
-        if ind.phenotype == 2:
-            if use_shading:
-                fill_mode = "shading"
-                shading_pat = shading_pattern
-                shading_cov = "half-left" if fill_type == "half" else "full"
-            elif fill_type == "half":
-                fill_mode = "half"
-                halves = [affected_color, None]
-            else:
+        if is_multi:
+            # Multi-phenotype: determine which phenotypes this person has
+            affected_phenos = [pn for pn in visual_phenotypes if ind.phenotypes.get(pn) == 2]
+            carrier_phenos = [pn for pn in visual_phenotypes if ind.phenotypes.get(pn) == 3]
+
+            if len(affected_phenos) >= 4:
+                # 4+ affected: quartered fill with first four colours
+                fill_mode = "quartered"
+                for qi in range(min(4, len(affected_phenos))):
+                    quarters[qi] = pheno_colors[affected_phenos[qi]]
+            elif len(affected_phenos) >= 2:
+                # 2-3 affected: quartered fill
+                fill_mode = "quartered"
+                for qi, pn in enumerate(affected_phenos[:4]):
+                    quarters[qi] = pheno_colors[pn]
+            elif len(affected_phenos) == 1:
+                # 1 affected: solid fill
                 fill_mode = "solid"
-                fill_color = affected_color
+                fill_color = pheno_colors[affected_phenos[0]]
+            elif len(carrier_phenos) >= 2:
+                # Multiple carrier: quartered with lighter treatment
+                fill_mode = "quartered"
+                for qi, pn in enumerate(carrier_phenos[:4]):
+                    quarters[qi] = pheno_colors[pn]
+            elif len(carrier_phenos) == 1:
+                # 1 carrier: half fill
+                fill_mode = "half"
+                halves = [pheno_colors[carrier_phenos[0]], None]
+
+            # Carrier column → centre dot (independent of colour-based carrier)
+            if carrier_column and ind.phenotypes.get(carrier_column) == 3:
+                center_text = "dot"
+
+        else:
+            # Single phenotype: use the existing styling options
+            pname = visual_phenotypes[0] if visual_phenotypes else None
+            pheno_val = ind.phenotypes.get(pname, ind.phenotype) if pname else ind.phenotype
+
+            if pheno_val == 2:
+                if use_shading:
+                    fill_mode = "shading"
+                    shading_pat = shading_pattern
+                    shading_cov = "half-left" if fill_type == "half" else "full"
+                elif fill_type == "half":
+                    fill_mode = "half"
+                    halves = [affected_color, None]
+                else:
+                    fill_mode = "solid"
+                    fill_color = affected_color
+            elif pheno_val == 3:
+                # Carrier in single-phenotype mode: half fill or dot
+                if fill_type == "half" or use_shading:
+                    center_text = "dot"
+                else:
+                    fill_mode = "half"
+                    halves = [affected_color, None]
+
+            # Carrier column → centre dot
+            if carrier_column and ind.phenotypes.get(carrier_column) == 3:
+                center_text = "dot"
 
         persons.append({
             "id": ps_id,
             "shape": shape,
             "x": round(ind.x, 1),
             "y": round(ind.y, 1),
-            "text": "",
+            "text": ind.label or ind.ind_id,
             "deceased": False,
             "proband": False,
             "fillMode": fill_mode,
             "fillColor": fill_color,
-            "quarters": [None, None, None, None],
+            "quarters": quarters,
             "halves": halves,
             "shadingPattern": shading_pat,
             "shadingCoverage": shading_cov,
-            "centerText": "",
+            "centerText": center_text,
             "miscarriageSex": "unknown",
             "noSnap": False,
             "siblingFixed": False,
@@ -525,7 +709,11 @@ def build_session(
                 })
 
     # Legend
-    if use_shading:
+    if is_multi:
+        for pname in visual_phenotypes:
+            if any(ind.phenotypes.get(pname, 0) >= 2 for ind in inds.values()):
+                legend_labels[pheno_colors[pname]] = pname
+    elif use_shading:
         cov = "half-left" if fill_type == "half" else "full"
         key = f"shading:{shading_pattern}:{cov}"
         legend_labels[key] = "Affected"
@@ -538,7 +726,7 @@ def build_session(
         "version": 4,
         "personIdCounter": pid_counter,
         "labelIdCounter": 0,
-        "lineIdCounter": max(pship_counter, cl_counter),
+        "lineIdCounter": max(pship_counter, cl_counter) if pship_counter or cl_counter else 0,
         "persons": persons,
         "labels": [],
         "partnerships": partnerships,
@@ -565,35 +753,48 @@ def convert(
     use_shading: bool = False,
     shading_pattern: str = "stripes",
     fill_type: str = "full",
+    notes: Optional[list] = None,
 ) -> dict:
-    """Convert PED-format text to a Pedigree Studio session dict.
+    """Convert PED or MPED format text to a Pedigree Studio session dict.
+
+    Automatically detects MPED format (by looking for '# MPED v' header).
+    For MPED with multiple phenotypes, each phenotype gets a distinct colour
+    from the palette and the affected_color/use_shading/fill_type options
+    are ignored. For single-phenotype files (standard PED or single-column
+    MPED), the styling options apply as before.
 
     Parameters
     ----------
     ped_text : str
-        Contents of a PED file.
+        Contents of a PED or MPED file.
     affected_color : str
-        Hex colour for affected individuals (when not using shading).
+        Hex colour for affected individuals (single-phenotype only).
     use_shading : bool
-        If True, use the shading fill mode instead of solid colour.
+        If True, use shading fill mode (single-phenotype only).
     shading_pattern : str
-        'stripes' or 'dots' (only used when use_shading is True).
+        'stripes' or 'dots' (single-phenotype, shading only).
     fill_type : str
-        'full' for solid/full-shape fill, 'half' for left-half fill.
+        'full' or 'half' (single-phenotype only).
+    notes : list, optional
+        If a list is given, notes on anything the drawing can't show as the
+        file does (a child with only one parent in the file, say) are added
+        to it.
 
     Returns
     -------
     dict
         A Pedigree Studio v4 session object, ready for JSON serialisation.
     """
-    inds = parse_ped(ped_text)
+    inds, phenotype_names = parse_ped(ped_text, notes)
     if not inds:
-        return build_session({}, {}, affected_color, use_shading, shading_pattern, fill_type)
+        return build_session({}, {}, phenotype_names, affected_color, use_shading, shading_pattern, fill_type)
 
+    if notes is not None:
+        notes.extend(parent_notes(inds))
     units = build_mating_units(inds)
     num_gens = assign_generations(inds)
     compute_layout(inds, units, num_gens)
-    return build_session(inds, units, affected_color, use_shading, shading_pattern, fill_type)
+    return build_session(inds, units, phenotype_names, affected_color, use_shading, shading_pattern, fill_type)
 
 
 def convert_file(
@@ -601,12 +802,12 @@ def convert_file(
     output_path: str,
     **kwargs,
 ) -> dict:
-    """Read a PED file and write the Pedigree Studio session JSON.
+    """Read a PED or MPED file and write the Pedigree Studio session JSON.
 
     Parameters
     ----------
     input_path : str
-        Path to the input .ped file.
+        Path to the input .ped or .mped file.
     output_path : str
         Path to the output .json file.
     **kwargs
@@ -617,31 +818,89 @@ def convert_file(
     dict
         The session dict that was written.
     """
-    with open(input_path, "r") as f:
+    with open(input_path, "r", encoding="utf-8-sig") as f:
         ped_text = f.read()
 
     session = convert(ped_text, **kwargs)
 
-    with open(output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(session, f, indent=2)
 
     return session
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(prog="ped2studio", description="Convert PED pedigree files to Pedigree Studio session JSON.")
-    parser.add_argument("input", help="Path to the input .ped file")
-    parser.add_argument("output", help="Path to the output .json file")
-    parser.add_argument("--color", "--colour", default="#1a2332", dest="color", help="Hex colour for affected individuals")
-    parser.add_argument("--shading", action="store_true", help="Use shading pattern instead of solid colour")
-    parser.add_argument("--pattern", choices=["stripes", "dots"], default="stripes", help="Shading pattern type")
-    parser.add_argument("--fill", choices=["full", "half"], default="full", help="Fill coverage: full or half")
-    args = parser.parse_args(argv)
-    try:
-        session = convert_file(args.input, args.output, affected_color=args.color, use_shading=args.shading, shading_pattern=args.pattern, fill_type=args.fill)
-        print(f"Converted: {len(session[chr(39)+chr(39).join('persons')]) if False else len(session['persons'])} individuals, {len(session['partnerships'])} partnerships, {len(session['childLinks'])} child links -> {args.output}")
-        return 0
-    except FileNotFoundError: print(f"Error: file not found: {args.input}", file=sys.stderr); return 1
-    except Exception as e: print(f"Error: {e}", file=sys.stderr); return 1
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="ped2studio",
+        description="Convert PED pedigree files to Pedigree Studio session JSON.",
+    )
+    parser.add_argument(
+        "input",
+        help="Path to the input .ped or .mped file",
+    )
+    parser.add_argument(
+        "output",
+        help="Path to the output .json file",
+    )
+    parser.add_argument(
+        "--color", "--colour",
+        default="#1a2332",
+        dest="color",
+        help="Hex colour for affected individuals (default: #1a2332)",
+    )
+    parser.add_argument(
+        "--shading",
+        action="store_true",
+        help="Use shading pattern instead of solid colour for affected individuals",
+    )
+    parser.add_argument(
+        "--pattern",
+        choices=["stripes", "dots"],
+        default="stripes",
+        help="Shading pattern type (default: stripes). Only used with --shading.",
+    )
+    parser.add_argument(
+        "--fill",
+        choices=["full", "half"],
+        default="full",
+        help="Fill coverage for affected individuals: 'full' for entire shape, 'half' for left half only (default: full).",
+    )
+    parser.add_argument("--version", action="version", version=f"ped2studio {__version__}")
 
-if __name__ == "__main__": sys.exit(main())
+    args = parser.parse_args(argv)
+
+    notes: list[str] = []
+    try:
+        session = convert_file(
+            args.input,
+            args.output,
+            affected_color=args.color,
+            use_shading=args.shading,
+            shading_pattern=args.pattern,
+            fill_type=args.fill,
+            notes=notes,
+        )
+        n_persons = len(session["persons"])
+        n_pships = len(session["partnerships"])
+        n_clinks = len(session["childLinks"])
+        print(
+            f"Converted: {n_persons} individuals, "
+            f"{n_pships} partnerships, "
+            f"{n_clinks} child links → {args.output}"
+        )
+        for note in notes:
+            print(f"  Note: {note}")
+        return 0
+    except FileNotFoundError as e:
+        if e.filename and e.filename != args.input:
+            print(f"Error: cannot write {e.filename}: its folder does not exist", file=sys.stderr)
+        else:
+            print(f"Error: file not found: {args.input}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
